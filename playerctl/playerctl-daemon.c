@@ -108,6 +108,39 @@ static gint player_compare(gconstpointer a, gconstpointer b) {
     return 0;
 }
 
+/**
+ * Check if a player is currently playing by examining the PlaybackStatus property
+ */
+static gboolean player_is_playing(struct Player *player) {
+    if (player == NULL || player->player_properties == NULL) {
+        return FALSE;
+    }
+    GVariant *playback_status = g_variant_lookup_value(player->player_properties, "PlaybackStatus", NULL);
+    if (playback_status == NULL) {
+        return FALSE;
+    }
+    const gchar *status = g_variant_get_string(playback_status, 0);
+    gboolean is_playing = (g_strcmp0(status, "Playing") == 0);
+    g_variant_unref(playback_status);
+    return is_playing;
+}
+
+/**
+ * Find the first playing player in the queue
+ */
+static struct Player *context_find_first_playing_player(struct PlayerctldContext *ctx) {
+    guint len = g_queue_get_length(ctx->players);
+    for (guint i = 0; i < len; ++i) {
+        struct Player *current = g_queue_pop_head(ctx->players);
+        gboolean is_playing = player_is_playing(current);
+        g_queue_push_tail(ctx->players, current);
+        if (is_playing) {
+            return current;
+        }
+    }
+    return NULL;
+}
+
 /*
  * Updates the properties for the player. Returns TRUE if the properties have
  * changed, or else FALSE.
@@ -1160,19 +1193,45 @@ static void player_signal_proxy_callback(GDBusConnection *connection, const gcha
         g_variant_unref(properties);
     }
 
-    if (changed && player != context_get_active_player(ctx)) {
-        g_debug("new active player: %s", player->well_known);
-        context_set_active_player(ctx, player);
-        player_update_position_sync(player, ctx, &error);
-        if (error != NULL) {
-            player->position = 0l;
-            g_warning("could not update player position: %s", error->message);
-            g_clear_error(&error);
+    struct Player *active_player = context_get_active_player(ctx);
+    
+    // If the active player changed and is now not playing, switch to a playing player if available
+    if (changed && player == active_player) {
+        if (!player_is_playing(active_player)) {
+            struct Player *playing_player = context_find_first_playing_player(ctx);
+            if (playing_player != NULL && playing_player != active_player) {
+                g_debug("active player stopped playing, switching to: %s", playing_player->well_known);
+                context_set_active_player(ctx, playing_player);
+                player_update_position_sync(playing_player, ctx, &error);
+                if (error != NULL) {
+                    playing_player->position = 0l;
+                    g_warning("could not update player position: %s", error->message);
+                    g_clear_error(&error);
+                }
+                context_emit_active_player_changed(ctx, &error);
+                if (error != NULL) {
+                    g_warning("could not emit active player change signal: %s", error->message);
+                    g_clear_error(&error);
+                }
+            }
         }
-        context_emit_active_player_changed(ctx, &error);
-        if (error != NULL) {
-            g_warning("could not emit all properties changed signal: %s", error->message);
-            g_clear_error(&error);
+    }
+    // If a non-active player changed, make it active only if it's playing
+    else if (changed && player != active_player) {
+        if (player_is_playing(player)) {
+            g_debug("new active player: %s", player->well_known);
+            context_set_active_player(ctx, player);
+            player_update_position_sync(player, ctx, &error);
+            if (error != NULL) {
+                player->position = 0l;
+                g_warning("could not update player position: %s", error->message);
+                g_clear_error(&error);
+            }
+            context_emit_active_player_changed(ctx, &error);
+            if (error != NULL) {
+                g_warning("could not emit all properties changed signal: %s", error->message);
+                g_clear_error(&error);
+            }
         }
     }
 
